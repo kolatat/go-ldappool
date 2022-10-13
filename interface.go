@@ -6,6 +6,23 @@ import (
 	"github.com/go-ldap/ldap/v3"
 )
 
+func (dir *Directory) StickyConn(ctx context.Context, fn func(stickyConn *ldap.Conn) error) error {
+	var dc *conn
+	var err error
+	err = dir.retry(func(strategy connReuseStrategy) error {
+		dc, err = dir.conn(ctx, strategy)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	defer dc.releaseConn(err)
+	dc.Lock()
+	defer dc.Unlock()
+	dc.needRebind = true
+	return fn(dc.internal)
+}
+
 func (dir *Directory) Search(ctx context.Context, searchRequest *ldap.SearchRequest) (res *ldap.SearchResult, err error) {
 	err = dir.retry(func(strategy connReuseStrategy) error {
 		res, err = dir.search(ctx, searchRequest, strategy)
