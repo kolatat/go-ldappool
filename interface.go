@@ -62,3 +62,60 @@ func (dir *Directory) searchWithPaging(ctx context.Context, req *ldap.SearchRequ
 	dc.Unlock()
 	return res, err
 }
+
+func (dir *Directory) Modify(ctx context.Context, modifyRequest *ldap.ModifyRequest) error {
+	return dir.retry(func(strategy connReuseStrategy) error {
+		dc, err := dir.conn(ctx, strategy)
+		if err != nil {
+			return err
+		}
+		defer dc.releaseConn(err)
+		dc.Lock()
+		err = dc.internal.Modify(modifyRequest)
+		dc.Unlock()
+		return err
+	})
+}
+
+func (dir *Directory) ModifyWithResult(ctx context.Context, modifyRequest *ldap.ModifyRequest) (res *ldap.ModifyResult, err error) {
+	return res, dir.retry(func(strategy connReuseStrategy) error {
+		dc, err := dir.conn(ctx, strategy)
+		if err != nil {
+			return err
+		}
+		defer dc.releaseConn(err)
+		dc.Lock()
+		res, err = dc.internal.ModifyWithResult(modifyRequest)
+		dc.Unlock()
+		return err
+	})
+}
+
+func (dir *Directory) Del(ctx context.Context, delRequest *ldap.DelRequest) error {
+	return dir.retry(func(strategy connReuseStrategy) error {
+		dc, err := dir.conn(ctx, strategy)
+		if err != nil {
+			return err
+		}
+		defer dc.releaseConn(err)
+		dc.Lock()
+		err = dc.internal.Del(delRequest)
+		dc.Unlock()
+		return err
+	})
+}
+
+func (dir *Directory) VerifyPassword(ctx context.Context, username, password string) error {
+	return dir.retry(func(strategy connReuseStrategy) error {
+		dc, err := dir.conn(ctx, strategy)
+		if err != nil {
+			return err
+		}
+		defer dc.releaseConn(err)
+		dc.Lock()
+		err = dc.internal.Bind(username, password)
+		dc.needRebind = true
+		dc.Unlock()
+		return err
+	})
+}
