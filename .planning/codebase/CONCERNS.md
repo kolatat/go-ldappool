@@ -1,5 +1,5 @@
 ---
-last_mapped_commit: 23ccb27db8c4e78284ada38c52c7e913f5fc89b1
+last_mapped_commit: 7f4e3b30fdd4733449a679ffc3ab431c184a6a36
 last_mapped_at: 2026-10-12
 ---
 # Codebase Concerns
@@ -238,6 +238,126 @@ last_mapped_at: 2026-10-12
 - Files: `connector.go`, `directory.go`
 - Risk: Data races on server latency and heap order.
 - Priority: Medium
+
+---
+
+## database/sql Drift and LDAP Pooling Risks
+
+**Analysis Date:** 2026-10-12
+
+**Scope and method:** The package is a port of the `database/sql` `DB` pool (README links the `go1.19.2` `sql.go`). This section was produced from the repository files only. The Go toolchain on the analysis machine is go1.27.2. `github.com/go-ldap/ldap` v3.4.6, the version pinned in `go.mod`, is not in the local module cache (v3.4.11 through v3.4.15 are). No upstream source was diffed and no network lookups were made. Items marked **Unverified** need a diff against current `database/sql/sql.go` and go-ldap source before anyone acts on them. Items marked **Verified** were confirmed by reading this repository.
+
+### A. Upstream behaviours likely missing from the copy
+
+**Verified (structural gaps in this repo):**
+- **No session-reset hook before reuse.** `database/sql` offers optional driver interfaces (`driver.SessionResetter`, `driver.Validator`) that the pool calls before reuse or on return. This package has no equivalent (the interfaces are present upstream; confirm against current source). The reuse path in `dir.conn` (`directory.go`, the `cachedOrNewConn` branch and the `connRequests` wake-up branch) runs only `c.rebind(ctx)`, which is a no-op unless `needRebind` is set and `Option.BindFunc` is non-nil. Nothing resets go-ldap session state. The closest analogue is `validateConnection` (`conn.go`), which issues `WhoAmI` and resets nothing.
+- **Bad-connection signal is an LDAP-specific classifier.** `IsBadConn` (`errors.go`) matches only `ldap.ErrorNetwork` and the package's own `ErrBadConn`. `database/sql` uses `driver.ErrBadConn` as the contract between driver and pool. Porting upstream retry logic requires that the LDAP layer produce the bad-conn signal reliably, which it does not (see section F).
+- **Context is not passed into the LDAP wire calls.** Upstream passes `ctx` into every driver call that supports it. Here `ctx` is checked only before waiting for a pooled connection (`dir.conn`, `select` on `ctx.Done()`) and before dialing (`connector.connect`). `Search`, `SearchWithPaging`, `Modify`, `ModifyWithResult`, `Del`, and the bind inside `VerifyPassword` take no context. The README (`README.md`, Features) already records this against go-ldap issue #326.
+
+**Unverified (upstream changes after go1.19.2 that may be missing):**
+- Upstream may have changed how the final operation error reaches `putConn`/`releaseConn`, or how `Rows`/`Tx` release connections. The local equivalent is the pattern in section B.
+- Upstream may have changed the `connRequests` structure to an ordered set for waiter fairness and cancellation. Here `dir.connRequests` is a `map[uint64]chan connRequest` (`directory.go`), and `putConnDirLocked` picks an arbitrary entry with `for ... range` followed by `break`, so waiters are served in map-iteration order rather than arrival order. Confirm the current upstream structure and intent before porting.
+- Upstream may have tightened the retry rules around `driver.ErrBadConn` (see section C).
+
+### B. Error-release pattern diverges from `database/sql` and is copied in several places
+
+**Verified:** every operation in `interface.go` uses `defer dc.releaseConn(err)`, and so do `search` and `searchWithPaging`. Go evaluates the arguments of a deferred call when the `defer` statement runs, so `err` is `nil` at release time. This is the root cause of the first Tech Debt item, and it matters for porting:
+
+- `StickyConn` (`interface.go`, line 19) has the same defect. Its `defer dc.releaseConn(err)` captures `err` after `dir.conn` has returned nil, so a `fn` that returns an `IsBadConn` error is released as healthy. `StickyConn` is not retried after `fn` runs, because `retry` wraps only connection acquisition.
+- `Modify`, `ModifyWithResult`, `Del`, and `VerifyPassword` declare `err` inside the retry closure and defer with the value that is nil at defer time.
+
+Upstream's pattern is to release through a closure that reads the final error (for example `defer func() { dc.releaseConn(err) }()` with a named result). **Unverified** that this matches the current upstream form exactly; check `sql.go` before copying.
+
+Porting risk: any new method copied from `interface.go` inherits the defect. The fix should be one helper, for example `func (dir *Directory) withConn(ctx, strategy, fn func(*conn) error) error`, that owns acquire, lock, call, and release in one place.
+
+### C. LDAP write retries can re-apply a change
+
+**Files:** `interface.go` (`Modify`, `ModifyWithResult`, `Del`, `VerifyPassword`), `directory.go` (`retry`, `maxBadConnRetries = 2`), `errors.go` (`IsBadConn`).
+
+- **Verified:** `dir.retry` re-runs the whole closure on any `IsBadConn` error: up to two times with `cachedOrNewConn`, then once with `alwaysNewConn`. For `Modify`, `ModifyWithResult`, and `Del`, the closure performs the write. A network error after the request has been sent (for example a reset or read failure while waiting for the response) can therefore lead to a second attempt, and the server may apply the change twice.
+- `Del` is the clearest case: a second attempt after a server-side success returns "no such object" and the caller sees a false failure. Non-idempotent modifications are worse.
+- **Unverified:** the `database/sql` contract for `driver.ErrBadConn` (whether it guarantees the statement was not sent) and whether go-ldap reports write-side and read-side failures with the same `ErrorNetwork` code. If it does not, the retry decision cannot be made safely in this package.
+- Recommendation: retry only before the request is written, or retry only reads. Keep retries on `Search` and `SearchWithPaging`; remove retries from write methods or make them an explicit opt-in.
+
+### D. Connection state leakage between pool users
+
+**Files:** `interface.go` (`StickyConn`, `VerifyPassword`), `conn.go` (`rebind`, `needRebind`), `connector.go` (`connect`, `BindFunc` on dial).
+
+- **Verified:** `needRebind` is set to `true` by `StickyConn` (before `fn`) and by `VerifyPassword` (after the bind, regardless of its result). Nothing in the package sets it back to `false`, so every later use of that connection pays for a `BindFunc` round-trip. This is a performance cost; the more serious consequence is identity.
+- **Verified:** if `Option.BindFunc` is nil, `rebind` is a no-op. The next borrower then runs its operations as whichever end user was last bound by `VerifyPassword` or `StickyConn`.
+- **Verified:** `VerifyPassword` sets `needRebind` even when `Bind` fails. A failed bind leaves the connection in an unknown bind state. Because the defer bug passes `nil` to `putConn`, that connection is pooled, not discarded.
+- **Verified:** `connect` runs `BindFunc` only on freshly dialed connections (`connector.go`). Connections reused from `freeConn` only get `rebind`, so the identity of a pooled connection depends on `needRebind` being set correctly.
+- **Verified:** the package sets no server controls and changes no connection options after dial. The only per-connection state it creates is the bind identity and the TLS state. But `StickyConn` hands the raw `*ldap.Conn` to `fn`, so any change `fn` makes (a control, a timeout, a SASL bind) persists for the next borrower, because nothing resets it.
+- Recommendations:
+  - Treat `StickyConn` as a reason to close the connection on exit rather than pool it, unless `BindFunc` always restores identity.
+  - Add a session-reset step that runs in `rebind`, clears `needRebind` only after a successful bind, and returns the error (see Tech Debt, "Errors from rebind are silently dropped").
+  - Use a separate pool for end-user credential checks, as already noted under Security Considerations.
+
+### E. Health checking of idle connections and server-side idle timeouts
+
+**Files:** `directory.go` (`conn`, `putConn`), `conn.go` (`validateConnection`), `directory_workers.go` (`connectionCleaner`).
+
+- **Verified:** an idle connection in `freeConn` is handed out with no liveness check. `dir.conn` runs only `rebind`. The only validation is `validateConnection`, which runs at return time.
+- **Verified:** `validateConnection` issues `WhoAmI` only when `lastValidated` is older than `minValidationDuration` (14 s). A newly dialed connection has a zero `lastValidated`, so its first return always validates. The call is synchronous in the caller's path and holds `conn.Mutex`.
+- **Verified:** `putConn` calls `validateConnection` only when `!IsBadConn(err)`. `err` is always `nil` there because of the defer bug, so validation runs on every release. A failed validation is assigned to `err`, but `IsBadConn(err)` is then checked, and a `WhoAmI` failure that is not `ErrorNetwork` is pooled anyway. The `// TODO might not work` comment at `directory.go` line 410 records this.
+- **Verified:** the cleaner (`connectionCleanerRunLocked`) closes idle connections by `maxIdleTime` and `maxLifetime`, but only for connections in `freeConn`. Both timers default to 0 (disabled). `conn()` checks `maxLifetime` on reuse but not `maxIdleTime`, so idle expiry depends on the cleaner waking up, which has a 1-second floor.
+- **Unverified (depends on deployment):** the idle disconnect limits of the domain controllers in use. This package cannot read them. Without a `maxIdleTime` below the server limit, the first operation after a quiet period can fail with a network error. That failure is then retried, which is costly for writes (section C).
+- Recommendations: set `ConnMaxIdleTime` below the server idle limit once it is known. Consider a cheap liveness probe (`WhoAmI`, or a RootDSE read) for connections idle longer than a threshold, run before the connection is handed out.
+
+### F. Error classification for retry versus discard
+
+**Files:** `errors.go` (`IsBadConn`), `connector.go` (`checkBadConn` in `connect`), `directory.go` (`retry`, `putConn`).
+
+- **Verified:** `IsBadConn` returns true only for `ldap.ErrorNetwork` and `ErrBadConn`.
+- **Unverified:** go-ldap may report some connection-level failures under other result codes. Candidates that could leave a connection unusable include the unsolicited Notice of Disconnection (OID `1.3.6.1.4.1.1466.20036`), `unavailable` (52), `busy` (51), `protocolError` (2), and `unwillingToPerform` (53) during server shutdown. Whether go-ldap surfaces the Notice of Disconnection to callers, and under which code, is not determined from this repo.
+- **Verified:** `connector.checkBadConn` penalizes a server only for `IsBadConn` errors. Dial errors returned directly by `net` (`*net.OpError`), TLS handshake errors, and `io.EOF` may not be wrapped as `ErrorNetwork`, in which case a dead server keeps its low latency and stays at the top of the heap. **Unverified:** what go-ldap v3.4.6 wraps in `ErrorNetwork`.
+- **Verified:** `putConn` discards a connection only on `IsBadConn`. That shape is correct, but because of section B the discard path is effectively never reached from operations.
+- Recommendation: define the classification in one function, list the LDAP result codes that mean "discard connection", and test it against a fake server (see Test Coverage Gaps, "Error classification").
+
+### G. Context cancellation on non-context LDAP calls
+
+**Files:** `interface.go` (all operations), `connector.go` (`connect`, `ldap.DialURL`), `conn.go` (`validateConnection`).
+
+- **Verified:** the go-ldap calls this package makes (`Search`, `SearchWithPaging`, `Modify`, `ModifyWithResult`, `Del`, `Bind`, `WhoAmI`, `StartTLS`, `DialURL`) receive no context here. Once an operation starts, `ctx` cannot interrupt it. A caller whose context is cancelled during `Search` still waits for the response or a socket failure.
+- **Verified:** the package sets no per-operation deadline. An operation that never receives a response holds `dc.Lock` (in `search`, `searchWithPaging`, and each write method) indefinitely, and every other goroutine waiting on that connection queues behind it. `Option.Dialer` can carry a timeout for dialing only. **Unverified:** whether go-ldap v3.4.6 applies a default read timeout.
+- **Verified:** `ctx` is checked before `DialURL` in `connect`, but `DialURL` itself does not observe `ctx`.
+- **Abandoned-operation risk:** the common way to honour a context with a non-context API is to run the call in a goroutine and return on `ctx.Done()`. That leaves a response in flight on a connection the caller believes is free. Because go-ldap matches responses by message ID, a late response is normally discarded, but the connection must not return to the pool as healthy until the outstanding operation completes or the connection is closed. **Unverified:** go-ldap's exact behaviour for an abandoned request, which needs the v3.4.x source.
+- Recommendations: set a dial deadline through `Option.Dialer` (default one with a timeout), add per-operation read deadlines, and close rather than pool a connection whose call was interrupted.
+
+### H. Referral handling
+
+- **Verified:** the package sets no referral option (a search of the `.go` files finds no referral setting). Referral behaviour is whatever go-ldap defaults to. **Unverified:** that default in v3.4.6.
+- If referrals are followed, the library would open a new connection to a host outside the `connector` server list. That connection would bypass `BindFunc`, `StartTLS`, the TLS `ServerName` set in `connect`, and the latency heap. This is a security concern if referrals are followed automatically, since bind credentials could be sent to a host the caller never selected.
+- Recommendation: confirm go-ldap's referral default in v3.4.6, disable following explicitly if it is on, and document the decision in `README.md`.
+
+### I. Multi-server failover
+
+**Files:** `connector.go` (`connect`, `updateLatency`, `decayLatencies`, `newSRVConnector`), `directory.go` (`retry`).
+
+- **Verified:** `connect` dials `c.servers[0]` only. It never tries another server within one call. Failover happens only indirectly: an `IsBadConn` error from `checkBadConn` adds `badConnPenalty` (2 s) to that server, which moves it down the heap, and `dir.retry` then calls `connect` again.
+- **Verified:** `dir.retry` makes at most three attempts (two `cachedOrNewConn`, one `alwaysNewConn`). If the three attempts hit failing servers, the caller gets an error even when healthy servers exist. Without `Option.Dialer`, a blackholed server can take the OS TCP timeout per attempt.
+- **Verified:** the shuffle in `connect` (`rand.Shuffle(i, ...)` over `c.servers`) permutes only the zero-latency prefix. Once a server has a nonzero latency, servers with equal nonzero latency are not reordered among themselves, so the selection order is largely fixed.
+- **Verified:** `decayLatencies` runs on every `putConn`, not on a timer, so the decay rate depends on traffic. With no traffic, a penalized server stays penalized.
+- Recommendations: try up to `len(servers)` distinct servers inside `connect` before returning an error, filter the candidate set to healthy servers, and decay latency by wall-clock time rather than by call count.
+
+### J. Divergence from `sql.go` that makes porting harder
+
+Each item below is a place where the local code no longer matches the shape of `database/sql`, so an upstream change cannot be copied mechanically:
+
+- **`IsBadConn(ErrBadConn)` in `putConn`** (`directory.go`, line 420): the intent is to test the released error with `errors.Is`. The local version tests a constant, so the expiry branch is dead. Restoring the intent is a one-line change, but any upstream diff touching `putConn` will conflict with it.
+- **`closed` flag and `ErrDirClosed`** (`directory.go`, `conn.go`, `errors.go`): no `Close` exists (see Tech Debt), so every `closed` check is unreachable and upstream close-path changes have no counterpart.
+- **`closeDBLocked`** (`conn.go`, lines 41-49) is a leftover name from `sql.DB`, is never called, and does not match the lock-held close it implies. Porting upstream code that uses the same name will collide with it.
+- **`connector.connect` returns a `conn` with no `dir`** (`connector.go`, lines 180-187), and `dir` is set later in `openNewConnection` and `conn()`. Upstream sets the owner before any path can close a connection. That ordering difference is the cause of the nil-pointer item in Tech Debt.
+- **Pool limits are directory-wide.** `maxOpen` applies to the whole directory, not per server, so one slow server can hold all slots. `Directory.maxOpenPerServer` (`directory.go`) is never set from `Option` and never read in `conn()`, so it has no effect.
+- **Option names mirror `sql.DB`** (`connector.go`, `Option`: `MaxIdleConns`, `MaxOpenConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`), but the semantics are reimplemented, so a reader who knows `sql.DB` will assume behaviour that is not all present (for example, `ConnMaxIdleTime` is only enforced by the cleaner).
+- Recommendation: keep a mapping table in `README.md` from each local name to its `sql.go` counterpart, and avoid renaming functions that have upstream equivalents so that diffs stay readable.
+
+### K. What could not be determined from the code
+
+- Exact current `database/sql` behaviour for each item in section A (no upstream diff performed).
+- go-ldap v3.4.6 internals: which errors are wrapped as `ErrorNetwork`, whether a default read timeout applies, the referral default, and abandoned-request handling.
+- Server-side idle timeout values for any domain controller.
+- Whether the retry rules for `driver.ErrBadConn` changed in any Go release after go1.19.2, and how they apply to LDAP write operations.
 
 ---
 

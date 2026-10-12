@@ -1,5 +1,5 @@
 ---
-last_mapped_commit: 23ccb27db8c4e78284ada38c52c7e913f5fc89b1
+last_mapped_commit: 7f4e3b30fdd4733449a679ffc3ab431c184a6a36
 last_mapped_at: 2026-10-12
 ---
 <!-- refreshed: 2026-10-12 -->
@@ -245,6 +245,120 @@ Side package: `adhelper/interface.go` (AD `unicodePwd` encoding, used by callers
 **Logging:** `fmt.Println` in `connector.go` and `directory.go` (`PrintSRVs`). No logger abstraction.
 **Validation:** Connection validation via `WhoAmI` in `conn.validateConnection` (`conn.go`), throttled to once per 14 seconds (`minValidationDuration`).
 **Authentication:** Caller-supplied `Option.BindFunc` runs after dial and on rebind (`connector.go`, `conn.go`). `VerifyPassword` in `interface.go` binds as the user and marks the connection for rebind.
+
+## database/sql Parity and SQL-vs-LDAP Differences
+
+**Verification scope (2026-10-12):** Everything below was derived by reading the local `.go` files. The upstream `database/sql/sql.go` is not in the repository and was not fetched, so upstream comparisons are by construct name and role only. The README pins `go1.19.2`, the reference the copy was taken from; that reference is old and must be re-diffed against a current Go release before any upstream fix is ported. Items marked **Unverified** could not be confirmed from this repository (go-ldap v3.4.6 internals are not vendored here). Nothing here was executed; the deadlock and nil-dereference paths in D4 are inferred from reading the code.
+
+### Construct mapping
+
+| Local (ldappool) | File | database/sql counterpart | Status |
+|------------------|------|--------------------------|--------|
+| `Directory` | `directory.go` | `sql.DB` | Mirrored. No `Close()` and no `Ping()` (see D9) |
+| `Directory.mu`, `freeConn`, `numOpen`, `connRequests` (map keyed by `uint64`), `nextRequest`, `openerCh`, `maxIdleCount`, `maxOpen`, `maxLifetime`, `maxIdleTime`, `cleanerCh` | `directory.go` | same-named fields on `DB` | Mirrored (go1.19 shapes) |
+| `conn` | `conn.go` | `driverConn` | Mirrored, but wraps `*ldap.Conn` directly; no `driver.Conn` interface |
+| `connRequest` | `directory.go` | `connRequest` | Mirrored |
+| `connReuseStrategy` (`alwaysNewConn`, `cachedOrNewConn`) | `directory.go` | same | Mirrored |
+| `retry` (`maxBadConnRetries = 2`, then one `alwaysNewConn` attempt) | `directory.go` | `DB.retry` | Mirrored |
+| `conn(ctx, strategy)` | `directory.go` | `DB.conn` | Mirrored. Checks `ctx` at entry and while waiting; does not cancel a dial in progress (D5) |
+| `putConn`, `putConnDirLocked` | `directory.go` | `DB.putConn`, `putConnDBLocked` | Mirrored with divergences D1, D2, D6 |
+| `maybeOpenNewConnections` | `directory.go` | same | Mirrored |
+| `openNewConnection` | `directory.go` | `DB.openNewConnection` | **Diverges** (locking and counter bugs, D4) |
+| `connectionOpener` | `directory_workers.go` | same | Mirrored. Goroutine never stops (D9) |
+| `startCleanerLocked`, `connectionCleaner`, `connectionCleanerRunLocked` | `directory_workers.go` | same | Mirrored. Closes conns outside `dir.mu`, as upstream does |
+| `shortestIdleTimeLocked`, `maxIdleConnsLocked` (default 2) | `directory.go` | same | Mirrored |
+| `SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`, `SetConnMaxIdleTime` | `directory.go` | same | Mirrored |
+| `DBStats` (type alias to `sql.DBStats`), `Stats()` | `directory.go` | same | Reuses the stdlib struct; `numClosed` is commented out |
+| `conn.expired`, `conn.close` (panics on double close with `ErrDuplicateConnClose`) | `conn.go` | `driverConn.expired`, `close` | Mirrored. `closeDBLocked` is defined but never called |
+| `conn.validateConnection` | `conn.go` | `driver.Validator` / `validateConnection` | **LDAP substitute**: `WhoAmI`, throttled (see L1) |
+| `conn.rebind` | `conn.go` | `driver.SessionResetter` / `resetSession` | **LDAP substitute**: `Option.BindFunc`, conditional (see L2) |
+| `IsBadConn`, `ErrBadConn`, `ErrConnExpired` (`adErr`) | `errors.go` | `driver.ErrBadConn`, `ErrConnExpired`, `isBadConn` | **Diverges**: classification differs (L4) |
+| `ErrDirClosed`, `ErrNoServerDefined`, `ErrDuplicateConnClose` | `errors.go` | `sql` sentinel errors | `ErrDirClosed` is unreachable today (D9) |
+| `StickyConn` | `interface.go` | `sql.Conn` (`DB.Conn`) | Analogue. Pins a conn and sets `needRebind`; deferred error is stale (D2) |
+| `Search`, `SearchWithPaging`, `Modify`, `ModifyWithResult`, `Del`, `VerifyPassword` | `interface.go` | `DB.Query` / `DB.Exec` | LDAP-specific wrappers. Same retry-and-release shape; same stale-error bug (D2) |
+
+**Not mirrored (no local counterpart):** `Tx` / `Begin`, `Stmt` / `Prepare`, `Rows` / `Row` (results are fully materialized `*ldap.SearchResult`), generic `Exec` / `Query` / `QueryRow`, `Ping` / `PingContext`, `Close`, `driver.NamedValueChecker`, `driver.ErrSkip`, `sql.ErrNoRows`, `sql.ErrConnDone`.
+
+### Divergences from database/sql (defects and gaps found by reading)
+
+**D1. Dead lifetime check in `putConn`.** `directory.go:420` tests `!IsBadConn(ErrBadConn) && c.expired(...)`. `IsBadConn(ErrBadConn)` is always true, so the branch never runs. Lifetime expiry at release is never counted in `maxLifetimeClosed` or turned into `ErrConnExpired`. Expiry is still enforced on acquire in `conn()` (`directory.go:323`, `:370`). Fix: test `c.expired(dir.maxLifetime)` alone.
+
+**D2. Stale deferred error: bad connections are not closed on operation failure.** `StickyConn` (`interface.go:245`), `search` (`:265`), `searchWithPaging` (`:285`), `Modify` (`:298`), `ModifyWithResult` (`:312`), `Del` (`:326`), and `VerifyPassword` (`:340`) all write `defer dc.releaseConn(err)`. Go evaluates `err` when the `defer` statement runs, before the operation, so `putConn` always receives `nil`. Consequences, from reading:
+- A connection that fails with `ldap.ErrorNetwork` is returned to `freeConn` rather than closed.
+- `dir.retry` then retries. `cachedOrNewConn` pops the most recent free connection (`directory.go:318-321`), so the retry likely gets the same dead connection back. Up to three attempts can hit it before the `alwaysNewConn` dial.
+- Release-time detection depends on `validateConnection` (`conn.go:70`), which only pings if `lastValidated` is more than 14s old. A recently used dead connection passes release-time checks.
+- Upstream avoids this with a closure that reads the final error at return time. This copy has the bug the existing Anti-Patterns section describes.
+
+**D3. Silently ignored rebind failure.** `conn()` at `directory.go:331` and `:381` handles only `IsBadConn(err)` from `rebind`. A non-bad `BindFunc` error is dropped and the connection is handed to the caller in whatever state the failed bind left it. Upstream treats a failed session reset as a bad connection.
+
+**D4. `openNewConnection` self-deadlocks and double-decrements `numOpen`.** `openNewConnection` (`directory.go:151-175`) holds `dir.mu` via `defer dir.mu.Unlock()`. On the path where `putConnDirLocked` returns `false` for a live connection (`directory.go:171-173`), it calls `c.close()`. `conn.close()` (`conn.go:60`) then locks `c.dir.mu`, the same non-reentrant mutex, so this self-deadlocks. `numOpen` is also decremented twice (`directory.go:172` and `conn.go:61`). `putConnDirLocked` returns `false` when `maxIdle` is full with no waiter or `maxOpen` is exceeded, so this is reachable when an opener-created connection arrives after a release has already satisfied the waiter. A second defect is in the closed branch (`directory.go:155-159`): it calls `c.close()` before `c.dir` is set (`:168`), so `c.dir` is nil and `conn.close` dereferences it. That branch is latent only because `dir.closed` is never set (D9). Upstream releases `db.mu` before closing the connection.
+
+**D5. Context is honored only before and around dials.** `conn()` checks `ctx` at entry (`directory.go:312`) and while waiting (`:349`). `connector.connect` checks it once before dialing (`connector.go:135`). `ldap.DialURL`, `StartTLS`, and every `ldap.Conn` operation are not cancellable, so a caller's deadline does not bound the LDAP round trip. Upstream passes `ctx` into driver methods.
+
+**D6. Validation error path is marked unfinished.** `putConn` (`directory.go:408-410`) carries `// TODO might not work, sql sets err=ErrBadConn`. The code assigns the `WhoAmI` error to `err`. Non-bad LDAP errors (for example a result code from `WhoAmI`) are then kept in the pool, because only `ErrorNetwork` is treated as bad.
+
+**D7. Queue size comment disagrees with value.** `directory.go:46` sets `connectionRequestQueueSize = 10000 // // 1Mil`. The comment says one million. Which one is intended cannot be determined from the code. This value sizes `openerCh` (`directory.go:59`).
+
+**D8. `rebind` never clears `needRebind`.** `conn.rebind` (`conn.go:87-94`) runs `BindFunc` when `needRebind` is set but never resets it. The flag is only set, by `StickyConn` (`interface.go:248`) and `VerifyPassword` (`interface.go:343`). Every later acquisition of that connection therefore re-runs `BindFunc`, one extra bind per acquire. Whether this is intended (rebind on every reuse) or an omission (clear after one rebind) cannot be determined from the code; no test covers it.
+
+**D9. No lifecycle: `Close` is absent and `closed` is never set.** `Directory` has a `stop func()` field (`directory.go:42`) set to a context cancel (`:55-61`), but nothing calls it. `dir.closed` is never assigned `true`. The `connectionOpener` goroutine therefore lives for the life of the process, and `ErrDirClosed` (`directory.go:308`, `:368`) and every `dir.closed` branch are unreachable. `maxOpenPerServer` (`directory.go:33`) is declared and never used. `closeDBLocked` (`conn.go:41`) is never called.
+
+### LDAP-specific differences
+
+**L1. No standard reset or ping: the stand-ins.**
+- *Reset (`driver.SessionResetter` analogue):* `conn.rebind` (`conn.go:87`) re-runs `Option.BindFunc` only when `needRebind` is set, and is a no-op when `BindFunc` is nil (`conn.go:90`). Nothing else resets identity.
+- *Ping/validate (`driver.Pinger` / `Validator` analogue):* `conn.validateConnection` (`conn.go:66`) calls `WhoAmI(nil)` only if `lastValidated` is more than `minValidationDuration` (14s, `conn.go:13`) old. It runs only at release from `putConn` (`directory.go:408`), never at acquire. A successful `WhoAmI` also feeds the latency update (`conn.go:75`).
+- *Fresh connections:* `connector.connect` runs `BindFunc` once, before the connection is returned (`connector.go:173-178`). Fresh connections are not rebound on acquire.
+
+**L2. Per-connection bind state and how it is returned to the pool.**
+- A pooled `*ldap.Conn` carries its bound identity. The pool tracks only the `needRebind` boolean (`conn.go:25`), not which identity is bound.
+- `VerifyPassword` (`interface.go:334-346`) binds the pooled connection as the end user (`interface.go:342`) and sets `needRebind`. The user's identity stays on the connection after `releaseConn`. The next caller gets it reset only if `Option.BindFunc` is set. With `BindFunc == nil`, the next `Search` or `Modify` on that connection can run as the verified user. This follows from reading `conn.rebind` and `VerifyPassword`; the code does not document it as intended. Treat it as a risk.
+- `needRebind` is set before the bind result is checked (`interface.go:343`). A failed bind (invalid credentials) still marks the connection for rebind. This is harmless but not obviously intended.
+- `StartTLS` is applied once at dial (`connector.go:165-170`) and is per-connection state. It is not reapplied on rebind.
+
+**L3. No transactions, prepared statements, or streaming rows.**
+- Each public method is one LDAP request or one paged search. Grouping operations on one connection is possible only through `StickyConn`, which holds the connection lock for the duration of the caller callback (`interface.go:246-249`).
+- `Search` returns a fully materialized `*ldap.SearchResult`. `SearchWithPaging` loops over pages inside `ldap.Conn.SearchWithPaging` while `dc.Lock()` is held (`interface.go:286-288`), so one large paged search blocks other callers of that connection for its whole duration.
+- Upstream `Rows` streaming and `Tx` isolation have no analogue here and are not needed for LDAP's request model.
+
+**L4. Bad-connection detection and error classification.**
+- `IsBadConn` (`errors.go:124-135`) treats only `ldap.ErrorNetwork` and `ErrBadConn` (including `ErrConnExpired`, which wraps it) as bad. LDAP result codes such as `49` (invalid credentials) are not bad and the connection goes back to the pool.
+- Upstream's `driver.ErrBadConn` has no LDAP equivalent. The local sentinel is produced only by `ErrConnExpired` in this repository.
+- **Unverified:** whether go-ldap v3.4.6 maps a server-closed idle socket (EOF on read) to `ErrorNetwork`. If it does not, idle drops are never classified as bad, and the connection stays pooled until a `WhoAmI` at release fails with a non-bad error. The go-ldap source is not in the repo.
+- Server idle drops are therefore caught only by: (a) `WhoAmI` at release, and only if more than 14s have passed since the last validation (`conn.go:70`); (b) a failed operation, but only if D2 does not hide the error; or (c) the next operation failing and `dir.retry` trying again.
+- Latency penalty: `connector.connect` penalizes the chosen server by `badConnPenalty` (2s) when dial, StartTLS, or bind returns a bad error (`connector.go:140-145`, `:161-176`). Errors from operations after dial do not penalize the server at all, so a server that drops connections mid-session is never penalized directly.
+- `connector.go:142` calls `fmt.Println(err)` on every bad dial, the same stdout-logging issue noted in the Anti-Patterns section.
+
+**L5. Referrals: not handled.**
+- No file in the repository inspects referrals. Operation results are returned as-is, and the referral field on `ldap.SearchResult` (a go-ldap field; confirm the name in v3.4.6) is never read.
+- **Unverified:** whether go-ldap follows referrals automatically on any operation. This repository does not show it.
+- Callers that need referral chasing must do it themselves, against a server they choose, outside the pool.
+
+**L6. Multiple servers and DNS SRV discovery.**
+- `newSRVConnector` (`connector.go:53-103`) runs `net.LookupSRV("ldaps","tcp",domain)` first unless `Option.LDAPsPort != 0` (`:66`), then `net.LookupSRV("ldap","tcp",domain)` (`:84`). An `ldap` record whose target also appears in the `ldaps` list is skipped by hostname (`:90`), regardless of port.
+- Both lookups return an error on failure, and the `ldap` lookup error is returned unconditionally (`:84-86`). From reading, `OpenDirectory` therefore fails when the `ldap` SRV lookup has no records, even if `ldaps` records exist. This depends on Go's `net.LookupSRV` returning an error for empty results (stdlib behavior, not checked here).
+- With `LDAPsPort` set, the `ldaps` lookup is skipped and `ldap` records are rewritten to `ldaps` on the forced port (`connector.go:152-155`).
+- SRV `Priority` and `Weight` are not read anywhere (no references in the repository). Ordering is by measured latency only, through `srvHeap` (`server.go:153-184`). Every server starts at `latency: 1ms` (`connector.go:76`, `:94`), so the initial order is the order `net.LookupSRV` returns, which Go sorts by priority and randomizes by weight.
+- SRV records are resolved once, in `OpenDirectory`. There is no re-resolution.
+- `connector.connect` picks only `servers[0]`, the heap root (`connector.go:128`). It does not iterate servers within one call. Failover happens across attempts: the penalty (L4) moves the failed server down the heap, and the next `dir.retry` attempt picks a different root.
+- Shuffling applies only to servers whose latency has decayed to exactly zero (`connector.go:120-127`). Latencies start at 1ms and decay multiplicatively, so zero is reached only after long decay. This is an edge case of the copied logic.
+- Latency update: a success blends the sample as `(latency + 2*dt)/3` (`connector.go:197`); a failure adds `badConnPenalty` (`:194-195`). Decay runs on every release (`putConn`, `directory.go:413`) and scales every server except the one just used (`connector.go:202-226`).
+
+**L7. Context does not reach LDAP operations.** Covered by D5. Relevant here because `StickyConn`'s callback receives a raw `*ldap.Conn` (`interface.go:235`) and cannot be interrupted by `ctx`.
+
+**L8. `adhelper` sits outside the pool.**
+- `adhelper.ResetPassword` (`adhelper/interface.go:361-370`) encodes a password as UTF-16LE into a `unicodePwd` `Replace` on an `*ldap.ModifyRequest`. The caller then passes the request to `Directory.Modify` or `Directory.ModifyWithResult`. The pool is not involved in building the request.
+- The password is formatted with `fmt.Sprintf("%q", password)` (`adhelper/interface.go:364`). `%q` wraps in double quotes, which AD requires, but it also backslash-escapes embedded `"` and `\` and non-printable characters using Go syntax. AD would store those escapes literally. **Unverified against AD**; a password containing those characters is likely to be stored incorrectly.
+- AD requires `unicodePwd` writes over an encrypted channel (LDAPS or StartTLS). Nothing in `adhelper` or in `Directory.Modify` enforces that. The channel is TLS only when `Option.StartTLS` is set or an `ldaps` SRV target is used (`connector.go:165`, `:84`). The caller must ensure it.
+- The package-level `utf16le` encoder (`adhelper/interface.go:357-359`) is shared state. Whether a `transform.Encoder` is safe for concurrent `String` calls is **Unverified** here.
+
+### Upstream-sync checklist (for future ports)
+
+1. Re-diff against a current `database/sql/sql.go`. The mapping table is by name; upstream has changed since go1.19 (for example, connection request bookkeeping and the session-reset path).
+2. Fix D2 first. The stale-error pattern undermines the `IsBadConn` retry that every other behavior depends on.
+3. Fix D4 before any change to `openNewConnection`. Its locking differs from upstream and should be ported, not patched in place.
+4. Decide D8 (rebind on every acquire) and the `BindFunc == nil` identity leak (L2) explicitly. They are behavior choices, not parity gaps.
+5. Decide D7 (queue size) by intent, not by the comment.
 
 ---
 
