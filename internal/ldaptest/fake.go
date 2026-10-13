@@ -54,6 +54,12 @@ type ModifyRecord struct {
 	Changes []ModifyChange
 }
 
+// connState is the per-connection state of a live client connection.
+type connState struct {
+	seq      int    // accept order, starting at 1
+	identity string // DN of the last successful bind; empty while anonymous
+}
+
 // Fake is an in-process LDAP server speaking the real wire protocol. It serves
 // bind, search, modify and delete from a small in-memory directory, counts every
 // request it receives and records what modify and delete carried.
@@ -67,6 +73,8 @@ type Fake struct {
 	counts  map[string]int
 	modlog  []ModifyRecord
 	deleted []string
+	conns   map[net.Conn]*connState // live client connections
+	accepts int                     // connections accepted so far
 
 	stop     chan struct{} // closed by Stop; handlers that block must select on it
 	stopped  chan struct{} // closed when Serve returns
@@ -84,7 +92,73 @@ type acceptSignal struct {
 
 func (a *acceptSignal) Accept() (net.Conn, error) {
 	a.once.Do(func() { close(a.entered) })
-	return a.Listener.Accept()
+	c, err := a.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &fixedConn{Conn: c}, nil
+}
+
+// fixedConn repairs the message ID of every LDAP message the server writes.
+//
+// The goldap encoder used by the server library writes an INTEGER of 128..255
+// (and 32768..65535, and so on) without the leading zero byte that keeps it
+// positive, so a client decodes message ID 133 as -123 and drops the response.
+// A connection therefore stops working after 127 requests. The server writes
+// each LDAP message with exactly one Write call (it flushes after every
+// message), so each Write can be repaired on its own.
+type fixedConn struct {
+	net.Conn
+}
+
+func (c *fixedConn) Write(p []byte) (int, error) {
+	if _, err := c.Conn.Write(fixMessageID(p)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// fixMessageID returns the LDAP message p with its message ID re-encoded as a
+// non-negative INTEGER. Message IDs are never negative (RFC 4511 section 4.1.1),
+// so an ID whose first content byte has the high bit set is the encoder bug.
+// p is returned unchanged when it is well formed or not recognised.
+func fixMessageID(p []byte) []byte {
+	if len(p) < 2 || p[0] != 0x30 { // outer SEQUENCE
+		return p
+	}
+	hdr, length := 2, int(p[1])
+	if p[1]&0x80 != 0 {
+		n := int(p[1] & 0x7f)
+		if n == 0 || n > 4 || len(p) < 2+n {
+			return p
+		}
+		hdr, length = 2+n, 0
+		for _, b := range p[2:hdr] {
+			length = length<<8 | int(b)
+		}
+	}
+	if len(p) != hdr+length || len(p) < hdr+3 || p[hdr] != 0x02 { // INTEGER
+		return p
+	}
+	idLen := int(p[hdr+1])
+	if idLen >= 0x80 || len(p) < hdr+2+idLen || idLen == 0 || p[hdr+2]&0x80 == 0 {
+		return p
+	}
+	body := make([]byte, 0, length+1)
+	body = append(body, 0x02, byte(idLen+1), 0x00)
+	body = append(body, p[hdr+2:]...)
+
+	out := []byte{0x30}
+	if n := len(body); n < 0x80 {
+		out = append(out, byte(n))
+	} else if n < 0x100 {
+		out = append(out, 0x81, byte(n))
+	} else if n < 0x10000 {
+		out = append(out, 0x82, byte(n>>8), byte(n))
+	} else {
+		out = append(out, 0x83, byte(n>>16), byte(n>>8), byte(n))
+	}
+	return append(out, body...)
 }
 
 // NewFake serves LDAP on ln and returns once the server is accepting. The Fake
@@ -95,6 +169,7 @@ func NewFake(ln net.Listener) *Fake {
 		srv:     ldapserver.NewServer(),
 		users:   make(map[string]string),
 		counts:  make(map[string]int),
+		conns:   make(map[net.Conn]*connState),
 		stop:    make(chan struct{}),
 		stopped: make(chan struct{}),
 	}
@@ -103,7 +178,14 @@ func NewFake(ln net.Listener) *Fake {
 	mux.Search(f.route(OpSearch, f.doSearch))
 	mux.Modify(f.route(OpModify, f.doModify))
 	mux.Delete(f.route(OpDelete, f.doDelete))
+	mux.Extended(f.route(OpWhoAmI, f.doWhoAmI)).RequestName(ldapserver.NoticeOfWhoAmI)
 	f.srv.Handle(mux)
+	// Per-connection state is keyed by the net.Conn, never by the server
+	// library's single per-client data field: request goroutines of one client
+	// run concurrently and would race on that single field. m.Client.GetConn()
+	// returns the same net.Conn these hooks receive.
+	f.srv.OnNewConnection = f.onConnect
+	f.srv.OnClientClose = f.onClose
 
 	sig := &acceptSignal{Listener: ln, entered: make(chan struct{})}
 	go func() {
@@ -161,6 +243,83 @@ func (f *Fake) AddEntry(dn string, attrs map[string][]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.entries = append(f.entries, entry{dn: dn, key: normDN(dn), attrs: cp})
+}
+
+// onConnect registers state for a newly accepted connection. It runs before
+// the connection's first request is read.
+func (f *Fake) onConnect(c net.Conn) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.accepts++
+	f.conns[c] = &connState{seq: f.accepts}
+	return nil
+}
+
+// onClose forgets a connection whose session ended. It must not block.
+func (f *Fake) onClose(c net.Conn, _ any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.conns, c)
+}
+
+// setIdentity records the bound identity of c. A connection that is already
+// gone is ignored.
+func (f *Fake) setIdentity(c net.Conn, identity string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if st := f.conns[c]; st != nil {
+		st.identity = identity
+	}
+}
+
+// identityOf returns the bound identity of c, empty while anonymous.
+func (f *Fake) identityOf(c net.Conn) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if st := f.conns[c]; st != nil {
+		return st.identity
+	}
+	return ""
+}
+
+// Identities returns the bound identity of every live connection in accept
+// order. An empty string means the connection is anonymous.
+func (f *Fake) Identities() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	states := make([]*connState, 0, len(f.conns))
+	for _, st := range f.conns {
+		states = append(states, st)
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].seq < states[j].seq })
+	out := make([]string, len(states))
+	for i, st := range states {
+		out[i] = st.identity
+	}
+	return out
+}
+
+// NumConns returns the number of client connections the server currently holds.
+func (f *Fake) NumConns() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.conns)
+}
+
+// CloseConns closes every server-side connection, so each client sees the
+// socket close. The server's session teardown then removes them from NumConns.
+func (f *Fake) CloseConns() {
+	f.mu.Lock()
+	conns := make([]net.Conn, 0, len(f.conns))
+	for c := range f.conns {
+		conns = append(conns, c)
+	}
+	f.mu.Unlock()
+	// Closing triggers the client-close hook, which takes mu: close only after
+	// releasing it.
+	for _, c := range conns {
+		_ = c.Close()
+	}
 }
 
 // ModifyLog returns every modify request the server received, in arrival order,
@@ -226,10 +385,12 @@ func (f *Fake) Stop() {
 
 // doBind answers a bind request. An empty DN with an empty password is an
 // anonymous bind; a known DN with its password succeeds; everything else,
-// including non-simple authentication, is invalid credentials (49).
+// including non-simple authentication, is invalid credentials (49). A success
+// stores the DN as sent as the connection's identity; a failure clears it.
 func (f *Fake) doBind(m *ldapserver.Message) []msg.ProtocolOp {
 	r := m.GetBindRequest()
 	code := ldapserver.LDAPResultInvalidCredentials
+	identity := ""
 	if r.AuthenticationChoice() == "simple" {
 		dn, pw := string(r.Name()), string(r.AuthenticationSimple())
 		f.mu.Lock()
@@ -237,13 +398,31 @@ func (f *Fake) doBind(m *ldapserver.Message) []msg.ProtocolOp {
 		f.mu.Unlock()
 		if (dn == "" && pw == "") || (known && want == pw) {
 			code = ldapserver.LDAPResultSuccess
+			identity = dn
 		}
 	}
+	// A failed bind leaves the connection anonymous (RFC 4511 section 4.2.1),
+	// so identity is stored unconditionally: empty on failure.
+	f.setIdentity(m.Client.GetConn(), identity)
 	res := ldapserver.NewBindResponse(code)
 	if code != ldapserver.LDAPResultSuccess {
 		res.SetDiagnosticMessage("invalid credentials")
 	}
 	return []msg.ProtocolOp{res}
+}
+
+// doWhoAmI answers a "who am I?" request with dn:<identity> for a bound
+// connection and an empty authzId for an anonymous one (RFC 4532).
+func (f *Fake) doWhoAmI(m *ldapserver.Message) []msg.ProtocolOp {
+	value := ""
+	if id := f.identityOf(m.Client.GetConn()); id != "" {
+		value = "dn:" + id
+	}
+	resp, err := whoAmIResponse(value)
+	if err != nil {
+		return []msg.ProtocolOp{ldapserver.NewExtendedResponse(ldapserver.LDAPResultOperationsError)}
+	}
+	return []msg.ProtocolOp{resp}
 }
 
 // doModify records the request and applies it to the stored entry when the DN

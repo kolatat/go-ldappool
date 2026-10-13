@@ -2,9 +2,15 @@ package ldaptest
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
+	msg "github.com/vjeantet/goldap/message"
+	"github.com/vjeantet/ldapserver"
 	"go.uber.org/goleak"
 )
 
@@ -14,6 +20,24 @@ import (
 func verifyNoLeaks(tb testing.TB) {
 	tb.Helper()
 	tb.Cleanup(func() { goleak.VerifyNone(tb) })
+}
+
+// eventually polls cond every 2 ms until it returns true, and fails the test
+// if timeout passes first. It replaces fixed sleeps for "flips" and "returns to
+// zero" assertions.
+func eventually(tb testing.TB, timeout time.Duration, cond func() bool) {
+	tb.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	for !cond() {
+		select {
+		case <-deadline.C:
+			tb.Fatalf("condition not met within %v", timeout)
+		case <-tick.C:
+		}
+	}
 }
 
 // TestFakeTracer drives one bind and one search, plus a failing bind, through
@@ -189,5 +213,218 @@ func TestFakeModifyDelete(t *testing.T) {
 	}
 	if got := len(f.ModifyLog()); got != 3 {
 		t.Errorf("ModifyLog length = %d, want 3 (unknown DN is recorded)", got)
+	}
+}
+
+const (
+	adminDN = "cn=admin,dc=example,dc=com"
+	bobDN   = "cn=bob,dc=example,dc=com"
+)
+
+// whoAmI returns the authzId the server reports for c.
+func whoAmI(tb testing.TB, c *ldap.Conn) string {
+	tb.Helper()
+	w, err := c.WhoAmI(nil)
+	if err != nil {
+		tb.Fatalf("whoami: %v", err)
+	}
+	return w.AuthzID
+}
+
+func TestFakeWhoAmI(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+	f.AddUser(adminDN, "secret")
+
+	c, err := f.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if got := whoAmI(t, c); got != "" {
+		t.Errorf("anonymous authzId = %q, want empty", got)
+	}
+	if err := c.Bind(adminDN, "secret"); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if got, want := whoAmI(t, c), "dn:"+adminDN; got != want {
+		t.Errorf("bound authzId = %q, want %q", got, want)
+	}
+	if got := f.Count(OpWhoAmI); got != 2 {
+		t.Errorf("whoami count = %d, want 2", got)
+	}
+}
+
+func TestFakeFailedBindClearsIdentity(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+	f.AddUser(adminDN, "secret")
+
+	c, err := f.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.Bind(adminDN, "secret"); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if got, want := whoAmI(t, c), "dn:"+adminDN; got != want {
+		t.Fatalf("authzId after bind = %q, want %q", got, want)
+	}
+	err = c.Bind(adminDN, "wrong")
+	if !ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
+		t.Fatalf("bind with wrong password: err = %v, want code %d", err, ldap.LDAPResultInvalidCredentials)
+	}
+	if got := whoAmI(t, c); got != "" {
+		t.Errorf("authzId after failed bind = %q, want empty", got)
+	}
+	if got := f.Identities(); len(got) != 1 || got[0] != "" {
+		t.Errorf("Identities = %q, want one anonymous connection", got)
+	}
+}
+
+func TestFakeIndependentIdentities(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+	f.AddUser(adminDN, "secret")
+	f.AddUser(bobDN, "hunter2")
+
+	c1, err := f.Dial()
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+	defer c1.Close()
+	// Wait for the first accept so the accept order is the dial order.
+	eventually(t, 2*time.Second, func() bool { return f.NumConns() == 1 })
+	c2, err := f.Dial()
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer c2.Close()
+	eventually(t, 2*time.Second, func() bool { return f.NumConns() == 2 })
+
+	if err := c1.Bind(adminDN, "secret"); err != nil {
+		t.Fatalf("bind 1: %v", err)
+	}
+	if err := c2.Bind(bobDN, "hunter2"); err != nil {
+		t.Fatalf("bind 2: %v", err)
+	}
+	if got, want := whoAmI(t, c1), "dn:"+adminDN; got != want {
+		t.Errorf("connection 1 authzId = %q, want %q", got, want)
+	}
+	if got, want := whoAmI(t, c2), "dn:"+bobDN; got != want {
+		t.Errorf("connection 2 authzId = %q, want %q", got, want)
+	}
+	got := f.Identities()
+	if len(got) != 2 || got[0] != adminDN || got[1] != bobDN {
+		t.Errorf("Identities = %q, want [%s %s]", got, adminDN, bobDN)
+	}
+}
+
+func TestFakeCloseConns(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+
+	var clients []*ldap.Conn
+	for i := 0; i < 3; i++ {
+		c, err := f.Dial()
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		defer c.Close()
+		clients = append(clients, c)
+	}
+	eventually(t, 2*time.Second, func() bool { return f.NumConns() == len(clients) })
+
+	f.CloseConns()
+	for _, c := range clients {
+		eventually(t, 2*time.Second, c.IsClosing)
+	}
+	for _, c := range clients {
+		c.Close()
+	}
+	eventually(t, 2*time.Second, func() bool { return f.NumConns() == 0 })
+}
+
+func TestFakeStopTwice(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+	c, err := f.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	c.Close()
+	f.Stop()
+	f.Stop() // the cleanup registered by NewTCP calls it a third time
+}
+
+func TestFakeConcurrentSearch(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+	f.AddEntry("cn=alice,dc=example,dc=com", map[string][]string{"cn": {"alice"}})
+
+	c, err := f.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	const workers, each = 8, 20
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*each)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				sr, err := c.Search(ldap.NewSearchRequest(
+					"dc=example,dc=com", ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+					0, 0, false, "(cn=alice)", nil, nil))
+				if err != nil {
+					errs <- err
+					return
+				}
+				if len(sr.Entries) != 1 {
+					errs <- fmt.Errorf("search returned %d entries, want 1", len(sr.Entries))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if got := f.Count(OpSearch); got != workers*each {
+		t.Errorf("search count = %d, want %d", got, workers*each)
+	}
+}
+
+// TestFixMessageID checks the wire repair of message IDs that the server
+// library's encoder gets wrong, across ID widths and length-field boundaries.
+func TestFixMessageID(t *testing.T) {
+	ids := []int{0, 1, 127, 128, 133, 255, 256, 32767, 32768, 65535, 65536, 8388608}
+	for _, id := range ids {
+		// Vary the body size around the 127/128 and 255/256 length boundaries.
+		for pad := 90; pad < 300; pad += 7 {
+			re := ldapserver.NewSearchResultEntry("cn=" + strings.Repeat("x", pad) + ",dc=example,dc=com")
+			m := msg.NewLDAPMessageWithProtocolOp(re)
+			m.SetMessageID(id)
+			b, err := m.Write()
+			if err != nil {
+				t.Fatalf("write id %d: %v", id, err)
+			}
+			fixed := fixMessageID(b.Bytes())
+			got, err := msg.ReadLDAPMessage(msg.NewBytes(0, fixed))
+			if err != nil {
+				t.Fatalf("id %d pad %d: fixed message does not parse: %v", id, pad, err)
+			}
+			if got.MessageID().Int() != id {
+				t.Fatalf("id %d pad %d: decoded as %d", id, pad, got.MessageID().Int())
+			}
+		}
 	}
 }
