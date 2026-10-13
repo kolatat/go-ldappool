@@ -273,3 +273,32 @@ func TestProxyPauseDuringUpstreamDial(t *testing.T) {
 		t.Error("connection closing after a timeout; it should be left open")
 	}
 }
+
+// TestProxyResumeReleasesAndClearsPauseNew: Resume releases data held by PauseNew
+// and also clears PauseNew, so a connection accepted afterwards forwards (WR-04).
+func TestProxyResumeReleasesAndClearsPauseNew(t *testing.T) {
+	verifyNoLeaks(t)
+	f, p := proxyFake(t)
+	p.PauseNew.Store(true)
+	c1 := proxyDial(t, f, p)
+
+	res := searchAsync(c1)
+	p.Resume()
+	if err := waitErr(t, res, "search held by PauseNew"); err != nil {
+		t.Errorf("held search after Resume: %v", err)
+	}
+	if p.PauseNew.Load() {
+		t.Error("PauseNew still set after Resume")
+	}
+
+	c2, err := ldap.DialURL("ldap://" + p.Addr())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = c2.Close() })
+	eventually(t, 2*time.Second, func() bool { return f.NumConns() >= 2 })
+	c2.SetTimeout(2 * time.Second)
+	if err := faultSearch(c2); err != nil {
+		t.Errorf("search on a connection accepted after Resume: %v", err)
+	}
+}

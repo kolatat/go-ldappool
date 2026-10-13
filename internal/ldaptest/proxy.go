@@ -16,7 +16,8 @@ import (
 type Proxy struct {
 	// PauseNew makes every connection accepted from now on start paused, so the
 	// kernel completes the TCP handshake (a dial succeeds) but no byte is ever
-	// forwarded: a blackhole from accept.
+	// forwarded: a blackhole from accept. It stays set until Resume clears it or
+	// the caller stores false.
 	PauseNew atomic.Bool
 
 	ln     net.Listener
@@ -230,8 +231,10 @@ func (p *Proxy) Pause() {
 	}
 }
 
-// Resume releases data held by Pause or PauseNew and lets forwarding continue.
+// Resume releases data held by Pause or PauseNew, clears PauseNew and lets
+// forwarding continue, so connections accepted afterwards forward normally.
 func (p *Proxy) Resume() {
+	p.PauseNew.Store(false)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for pr := range p.pairs {
