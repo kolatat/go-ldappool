@@ -40,9 +40,23 @@ type entry struct {
 	attrs map[string][]string
 }
 
+// ModifyChange is one change of a modify request exactly as the server received
+// it.
+type ModifyChange struct {
+	Op   int      // 0 add, 1 delete, 2 replace (RFC 4511 section 4.6)
+	Attr string   // attribute description as sent
+	Vals [][]byte // raw attribute values as sent
+}
+
+// ModifyRecord is one modify request exactly as the server received it.
+type ModifyRecord struct {
+	DN      string // target DN as sent, not normalised
+	Changes []ModifyChange
+}
+
 // Fake is an in-process LDAP server speaking the real wire protocol. It serves
-// bind and search from a small in-memory directory and counts every request it
-// receives.
+// bind, search, modify and delete from a small in-memory directory, counts every
+// request it receives and records what modify and delete carried.
 type Fake struct {
 	ln  net.Listener
 	srv *ldapserver.Server
@@ -51,6 +65,8 @@ type Fake struct {
 	users   map[string]string
 	entries []entry
 	counts  map[string]int
+	modlog  []ModifyRecord
+	deleted []string
 
 	stop     chan struct{} // closed by Stop; handlers that block must select on it
 	stopped  chan struct{} // closed when Serve returns
@@ -85,6 +101,8 @@ func NewFake(ln net.Listener) *Fake {
 	mux := ldapserver.NewRouteMux()
 	mux.Bind(f.route(OpBind, f.doBind))
 	mux.Search(f.route(OpSearch, f.doSearch))
+	mux.Modify(f.route(OpModify, f.doModify))
+	mux.Delete(f.route(OpDelete, f.doDelete))
 	f.srv.Handle(mux)
 
 	sig := &acceptSignal{Listener: ln, entered: make(chan struct{})}
@@ -145,6 +163,58 @@ func (f *Fake) AddEntry(dn string, attrs map[string][]string) {
 	f.entries = append(f.entries, entry{dn: dn, key: normDN(dn), attrs: cp})
 }
 
+// ModifyLog returns every modify request the server received, in arrival order,
+// exactly as sent. Requests for unknown DNs are included. The result is a copy.
+func (f *Fake) ModifyLog() []ModifyRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]ModifyRecord, len(f.modlog))
+	for i, r := range f.modlog {
+		out[i] = ModifyRecord{DN: r.DN, Changes: make([]ModifyChange, len(r.Changes))}
+		for j, c := range r.Changes {
+			vals := make([][]byte, len(c.Vals))
+			for k, v := range c.Vals {
+				vals[k] = append([]byte(nil), v...)
+			}
+			out[i].Changes[j] = ModifyChange{Op: c.Op, Attr: c.Attr, Vals: vals}
+		}
+	}
+	return out
+}
+
+// Deleted returns the DN of every delete request the server received, in
+// arrival order, exactly as sent. Requests for unknown DNs are included.
+func (f *Fake) Deleted() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deleted...)
+}
+
+// Entry returns a copy of the attributes of the stored entry named dn.
+func (f *Fake) Entry(dn string) (map[string][]string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i := f.indexLocked(normDN(dn))
+	if i < 0 {
+		return nil, false
+	}
+	cp := make(map[string][]string, len(f.entries[i].attrs))
+	for k, v := range f.entries[i].attrs {
+		cp[k] = append([]string(nil), v...)
+	}
+	return cp, true
+}
+
+// indexLocked returns the index of the entry with the normalised DN key, or -1.
+func (f *Fake) indexLocked(key string) int {
+	for i := range f.entries {
+		if f.entries[i].key == key {
+			return i
+		}
+	}
+	return -1
+}
+
 // Stop shuts the server down and waits for it to return. It is idempotent.
 func (f *Fake) Stop() {
 	f.stopOnce.Do(func() {
@@ -174,6 +244,102 @@ func (f *Fake) doBind(m *ldapserver.Message) []msg.ProtocolOp {
 		res.SetDiagnosticMessage("invalid credentials")
 	}
 	return []msg.ProtocolOp{res}
+}
+
+// doModify records the request and applies it to the stored entry when the DN
+// exists; an unknown DN yields no such object (32). The request is recorded
+// either way because the server did see it.
+func (f *Fake) doModify(m *ldapserver.Message) []msg.ProtocolOp {
+	r := m.GetModifyRequest()
+	rec := ModifyRecord{DN: string(r.Object())}
+	changes := r.Changes()
+	for i := range changes {
+		mod := changes[i].Modification()
+		c := ModifyChange{Op: int(changes[i].Operation()), Attr: string(mod.Type_())}
+		for _, v := range mod.Vals() {
+			c.Vals = append(c.Vals, []byte(string(v)))
+		}
+		rec.Changes = append(rec.Changes, c)
+	}
+
+	f.mu.Lock()
+	f.modlog = append(f.modlog, rec)
+	code := ldapserver.LDAPResultNoSuchObject
+	if i := f.indexLocked(normDN(rec.DN)); i >= 0 {
+		for _, c := range rec.Changes {
+			applyChange(f.entries[i].attrs, c)
+		}
+		code = ldapserver.LDAPResultSuccess
+	}
+	f.mu.Unlock()
+	return []msg.ProtocolOp{ldapserver.NewModifyResponse(code)}
+}
+
+// doDelete records the request and removes the entry when it exists; an
+// unknown DN yields no such object (32).
+func (f *Fake) doDelete(m *ldapserver.Message) []msg.ProtocolOp {
+	dn := string(m.GetDeleteRequest())
+
+	f.mu.Lock()
+	f.deleted = append(f.deleted, dn)
+	code := ldapserver.LDAPResultNoSuchObject
+	if i := f.indexLocked(normDN(dn)); i >= 0 {
+		f.entries = append(f.entries[:i], f.entries[i+1:]...)
+		code = ldapserver.LDAPResultSuccess
+	}
+	f.mu.Unlock()
+	return []msg.ProtocolOp{ldapserver.NewDeleteResponse(code)}
+}
+
+// applyChange applies one modify change to an attribute map. Attribute names
+// match case-insensitively, as in LDAP; an unmatched name is stored as sent.
+func applyChange(attrs map[string][]string, c ModifyChange) {
+	name := c.Attr
+	for k := range attrs {
+		if strings.EqualFold(k, c.Attr) {
+			name = k
+			break
+		}
+	}
+	vals := make([]string, len(c.Vals))
+	for i, v := range c.Vals {
+		vals[i] = string(v)
+	}
+	switch c.Op {
+	case 0: // add
+		attrs[name] = append(attrs[name], vals...)
+	case 1: // delete: the listed values, or the whole attribute when none are listed
+		if len(vals) == 0 {
+			delete(attrs, name)
+			return
+		}
+		var keep []string
+		for _, have := range attrs[name] {
+			if !containsString(vals, have) {
+				keep = append(keep, have)
+			}
+		}
+		if len(keep) == 0 {
+			delete(attrs, name)
+		} else {
+			attrs[name] = keep
+		}
+	case 2: // replace: no values removes the attribute
+		if len(vals) == 0 {
+			delete(attrs, name)
+		} else {
+			attrs[name] = vals
+		}
+	}
+}
+
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // doSearch returns every stored entry inside the request's base object and
