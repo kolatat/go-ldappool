@@ -86,6 +86,7 @@ type Fake struct {
 	srv *ldapserver.Server
 
 	behavior atomic.Pointer[func(op string) Behavior] // fault hook; nil means none
+	dial     func() (*ldap.Conn, error)               // set by NewTCP/NewPipe before first use
 
 	mu      sync.Mutex // guards following
 	users   map[string]string
@@ -278,14 +279,33 @@ func (f *Fake) route(name string, op func(*ldapserver.Message) []msg.ProtocolOp)
 	}
 }
 
-// Addr returns the listener's host:port.
-func (f *Fake) Addr() string { return f.ln.Addr().String() }
+// Addr returns the listener's host:port. A fake on a pipe transport (NewPipe)
+// has no address and returns an empty string.
+func (f *Fake) Addr() string {
+	if _, ok := f.ln.(*PipeListener); ok {
+		return ""
+	}
+	return f.ln.Addr().String()
+}
 
-// URL returns the ldap:// URL of the fake.
-func (f *Fake) URL() string { return "ldap://" + f.Addr() }
+// URL returns the ldap:// URL of the fake, or an empty string for a fake on a
+// pipe transport.
+func (f *Fake) URL() string {
+	if a := f.Addr(); a != "" {
+		return "ldap://" + a
+	}
+	return ""
+}
 
-// Dial opens a real go-ldap connection to the fake. The caller closes it.
-func (f *Fake) Dial() (*ldap.Conn, error) { return ldap.DialURL(f.URL()) }
+// Dial opens a real go-ldap connection to the fake over whichever transport the
+// fake was built on (TCP for NewTCP, an in-memory pipe for NewPipe). The caller
+// closes it.
+func (f *Fake) Dial() (*ldap.Conn, error) {
+	if f.dial != nil {
+		return f.dial()
+	}
+	return ldap.DialURL(f.URL())
+}
 
 // Count returns how many requests of the named operation the fake has received.
 func (f *Fake) Count(op string) int {

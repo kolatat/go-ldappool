@@ -11,6 +11,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/go-ldap/ldap/v3"
 	"github.com/vjeantet/ldapserver"
 )
 
@@ -30,6 +31,30 @@ func NewTCP(tb testing.TB) *Fake {
 		tb.Fatalf("ldaptest: listen on loopback: %v", err)
 	}
 	f := NewFake(ln)
+	f.dial = func() (*ldap.Conn, error) { return ldap.DialURL(f.URL()) }
+	tb.Cleanup(f.Stop)
+	return f
+}
+
+// NewPipe starts a Fake on an in-memory net.Pipe transport and registers its
+// Stop with tb.Cleanup. Call it inside a testing/synctest bubble so that the
+// fake's goroutines belong to the bubble; inside a bubble also call Stop and
+// close the clients explicitly before the bubble function returns. Dial returns
+// a go-ldap client on the client end of a fresh pipe. A pipe has no address, so
+// Addr and URL return empty strings.
+func NewPipe(tb testing.TB) *Fake {
+	tb.Helper()
+	ln := NewPipeListener()
+	f := NewFake(ln)
+	f.dial = func() (*ldap.Conn, error) {
+		end, err := ln.Dial()
+		if err != nil {
+			return nil, err
+		}
+		c := ldap.NewConn(end, false)
+		c.Start()
+		return c, nil
+	}
 	tb.Cleanup(f.Stop)
 	return f
 }
