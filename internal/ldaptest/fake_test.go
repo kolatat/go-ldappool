@@ -219,6 +219,7 @@ func TestFakeModifyDelete(t *testing.T) {
 const (
 	adminDN = "cn=admin,dc=example,dc=com"
 	bobDN   = "cn=bob,dc=example,dc=com"
+	carolDN = "cn=carol,dc=example,dc=com"
 )
 
 // whoAmI returns the authzId the server reports for c.
@@ -496,6 +497,160 @@ func TestFakeConcurrentSearchModify(t *testing.T) {
 	for name := range attrs {
 		if strings.HasPrefix(name, "tmp") {
 			t.Errorf("attribute %q left behind", name)
+		}
+	}
+}
+
+// TestFakeConcurrentMixedTraffic runs the traffic mix the pool phases will
+// generate against three connections at once: each connection binds as its own
+// user, then asks WhoAmI, searches, modifies, adds and deletes concurrently.
+// Every connection must only ever report its own identity.
+func TestFakeConcurrentMixedTraffic(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+	users := []struct{ dn, pw string }{
+		{adminDN, "secret"},
+		{bobDN, "hunter2"},
+		{carolDN, "swordfish"},
+	}
+	for _, u := range users {
+		f.AddUser(u.dn, u.pw)
+	}
+	const stableDN = "cn=alice,dc=example,dc=com"
+	f.AddEntry(stableDN, map[string][]string{
+		"cn":   {"alice"},
+		"sn":   {"seed"},
+		"mail": {"alice@example.com", "a@example.com"},
+	})
+
+	clients := make([]*ldap.Conn, len(users))
+	for i := range users {
+		c, err := f.Dial()
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		defer c.Close()
+		c.SetTimeout(10 * time.Second)
+		clients[i] = c
+	}
+	eventually(t, 2*time.Second, func() bool { return f.NumConns() == len(clients) })
+	for i, u := range users {
+		if err := clients[i].Bind(u.dn, u.pw); err != nil {
+			t.Fatalf("bind %d: %v", i, err)
+		}
+	}
+
+	const iterations = 200
+	var wg sync.WaitGroup
+	errs := make(chan error, 3*len(clients))
+	for i, u := range users {
+		c, idx, wantID := clients[i], i, "dn:"+u.dn
+		own := fmt.Sprintf("own%d", idx)
+		wg.Add(3)
+		go func() { // identity loop
+			defer wg.Done()
+			for n := 0; n < iterations; n++ {
+				w, err := c.WhoAmI(nil)
+				if err != nil {
+					errs <- fmt.Errorf("conn %d whoami %d: %w", idx, n, err)
+					return
+				}
+				if w.AuthzID != wantID {
+					errs <- fmt.Errorf("conn %d whoami %d: authzId = %q, want %q", idx, n, w.AuthzID, wantID)
+					return
+				}
+			}
+		}()
+		go func() { // search loop
+			defer wg.Done()
+			for n := 0; n < iterations; n++ {
+				sr, err := c.Search(ldap.NewSearchRequest(
+					"dc=example,dc=com", ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+					0, 0, false, "(cn=alice)", nil, nil))
+				if err != nil {
+					errs <- fmt.Errorf("conn %d search %d: %w", idx, n, err)
+					return
+				}
+				found := 0
+				for _, e := range sr.Entries {
+					if strings.EqualFold(e.DN, stableDN) {
+						found++
+						if got := e.GetAttributeValue("cn"); got != "alice" {
+							errs <- fmt.Errorf("conn %d search %d: cn = %q, want alice", idx, n, got)
+							return
+						}
+					}
+				}
+				if found != 1 {
+					errs <- fmt.Errorf("conn %d search %d: stable entry returned %d times, want 1", idx, n, found)
+					return
+				}
+			}
+		}()
+		go func() { // writer loop
+			defer wg.Done()
+			for n := 0; n < iterations; n++ {
+				req := ldap.NewModifyRequest(stableDN, nil)
+				if n%2 == 0 {
+					req.Replace(own, []string{"v"})
+				} else {
+					req.Delete(own, nil)
+				}
+				if err := c.Modify(req); err != nil {
+					errs <- fmt.Errorf("conn %d modify %d: %w", idx, n, err)
+					return
+				}
+				churn := fmt.Sprintf("cn=churn-%d-%d,dc=example,dc=com", idx, n)
+				f.AddEntry(churn, map[string][]string{"cn": {fmt.Sprintf("churn-%d-%d", idx, n)}})
+				if err := c.Del(ldap.NewDelRequest(churn, nil)); err != nil {
+					errs <- fmt.Errorf("conn %d delete %d: %w", idx, n, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	if got := f.Count(OpBind); got != len(users) {
+		t.Errorf("bind count = %d, want %d", got, len(users))
+	}
+	if got, want := f.Count(OpWhoAmI), len(users)*iterations; got != want {
+		t.Errorf("whoami count = %d, want %d", got, want)
+	}
+	if got, want := f.Count(OpDelete), len(users)*iterations; got != want {
+		t.Errorf("delete count = %d, want %d", got, want)
+	}
+	ids := f.Identities()
+	got := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		got[id] = true
+	}
+	if len(ids) != len(users) || !got[adminDN] || !got[bobDN] || !got[carolDN] {
+		t.Errorf("Identities = %q, want the set {%s %s %s}", ids, adminDN, bobDN, carolDN)
+	}
+	attrs, ok := f.Entry(stableDN)
+	if !ok {
+		t.Fatalf("entry %s missing", stableDN)
+	}
+	if v := attrs["cn"]; len(v) != 1 || v[0] != "alice" {
+		t.Errorf("cn = %q, want [alice]", v)
+	}
+	if _, left := f.Entry("cn=churn-0-0,dc=example,dc=com"); left {
+		t.Error("churn entry left behind")
+	}
+	sr, err := clients[0].Search(ldap.NewSearchRequest(
+		"dc=example,dc=com", ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+		0, 0, false, "(cn=*)", nil, nil))
+	if err != nil {
+		t.Fatalf("final search: %v", err)
+	}
+	for _, e := range sr.Entries {
+		if strings.Contains(strings.ToLower(e.DN), "churn-") {
+			t.Errorf("churn entry %q left behind", e.DN)
 		}
 	}
 }
