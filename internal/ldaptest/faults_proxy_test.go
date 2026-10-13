@@ -120,6 +120,8 @@ func TestFaultHalfOpenOperation(t *testing.T) {
 	verifyNoLeaks(t)
 	f, p := proxyFake(t)
 	c := proxyDial(t, f, p)
+	// Nothing is ever answered on this path, so the timeout is a one-sided wait: a
+	// slow runner only makes it fire later and cannot change the outcome.
 	c.SetTimeout(200 * time.Millisecond)
 
 	p.Pause()
@@ -140,6 +142,8 @@ func TestFaultBlackholeAtConnect(t *testing.T) {
 	f, p := proxyFake(t)
 	p.PauseNew.Store(true)
 	c := proxyDial(t, f, p)
+	// Nothing is ever answered on this path, so the timeout is a one-sided wait: a
+	// slow runner only makes it fire later and cannot change the outcome.
 	c.SetTimeout(200 * time.Millisecond)
 
 	ch := make(chan error, 1)
@@ -261,6 +265,8 @@ func TestProxyPauseDuringUpstreamDial(t *testing.T) {
 	release()
 	eventually(t, 2*time.Second, func() bool { return f.NumConns() >= 1 })
 
+	// Nothing is ever answered on this path, so the timeout is a one-sided wait: a
+	// slow runner only makes it fire later and cannot change the outcome.
 	c.SetTimeout(200 * time.Millisecond)
 	err = waitErr(t, searchAsync(c), "search on connection paused during dial")
 	if got := Classify(err); got != ClassNetwork {

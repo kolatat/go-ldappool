@@ -1,6 +1,7 @@
 package ldaptest
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -172,13 +173,19 @@ func TestFaultCloseRace(t *testing.T) {
 
 // TestFaultSlowResponse: a reply slower than the client timeout is a network
 // error, the connection stays open, and the late reply does not break later
-// requests.
+// requests. The reply is held on a gate the test controls, so it cannot arrive
+// before the client times out however slow the machine is; the 100 ms timeout
+// is then only the time the test waits, not a margin it relies on.
 func TestFaultSlowResponse(t *testing.T) {
 	verifyNoLeaks(t)
 	f := faultFake(t)
+	gate := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	t.Cleanup(release) // never leave a handler waiting if the test fails early
 	f.SetBehavior(func(op string) Behavior {
 		if op == OpSearch {
-			return Behavior{Delay: 300 * time.Millisecond}
+			return Behavior{Gate: gate}
 		}
 		return Behavior{}
 	})
@@ -192,10 +199,13 @@ func TestFaultSlowResponse(t *testing.T) {
 		t.Error("connection closing after a request timeout; it should stay open")
 	}
 
+	// Release the late reply to the timed-out request. The client discards it;
+	// the same connection serves the next request. The later requests get a
+	// generous timeout so a slow runner cannot fail them.
 	f.SetBehavior(nil)
-	// The late reply to the timed-out request is discarded by the client; the
-	// same connection serves the next request.
-	eventually(t, 2*time.Second, func() bool { return faultSearch(c) == nil })
+	release()
+	c.SetTimeout(5 * time.Second)
+	eventually(t, 5*time.Second, func() bool { return faultSearch(c) == nil })
 	if c.IsClosing() {
 		t.Error("connection closing after the late reply")
 	}

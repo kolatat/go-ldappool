@@ -81,6 +81,12 @@ type Behavior struct {
 	// Hang makes the server never respond. The handler blocks until the request
 	// is abandoned (the client connection ended) or the fake stops.
 	Hang bool
+	// Gate, when non-nil, makes the server wait until the channel is closed
+	// before applying the operation and replying. It gives a test control over
+	// when a late reply is released, instead of racing a wall-clock Delay
+	// against a client timeout. The wait also ends if the request is abandoned
+	// or the fake stops (in which case nothing is sent).
+	Gate <-chan struct{}
 	// CloseBefore closes the server-side connection on receipt, applying nothing
 	// and answering nothing.
 	CloseBefore bool
@@ -266,6 +272,15 @@ func (f *Fake) route(name string, op func(*ldapserver.Message) []msg.ProtocolOp)
 			case <-f.stop:
 			}
 			return
+		}
+		if b.Gate != nil {
+			select {
+			case <-b.Gate:
+			case <-m.Done:
+				return
+			case <-f.stop:
+				return
+			}
 		}
 		if b.Delay > 0 {
 			t := time.NewTimer(b.Delay)
