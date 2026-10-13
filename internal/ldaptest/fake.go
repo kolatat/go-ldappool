@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 	msg "github.com/vjeantet/goldap/message"
@@ -60,12 +62,30 @@ type connState struct {
 	identity string // DN of the last successful bind; empty while anonymous
 }
 
+// Behavior is the fault the fake injects into one request. The zero value is
+// normal service.
+type Behavior struct {
+	// Delay is how long the server waits before applying the operation.
+	Delay time.Duration
+	// Hang makes the server never respond. The handler blocks until the request
+	// is abandoned (the client connection ended) or the fake stops.
+	Hang bool
+	// CloseBefore closes the server-side connection on receipt, applying nothing
+	// and answering nothing.
+	CloseBefore bool
+	// CloseAfter applies the operation, then closes the server-side connection
+	// without answering ("apply, then drop").
+	CloseAfter bool
+}
+
 // Fake is an in-process LDAP server speaking the real wire protocol. It serves
 // bind, search, modify and delete from a small in-memory directory, counts every
 // request it receives and records what modify and delete carried.
 type Fake struct {
 	ln  net.Listener
 	srv *ldapserver.Server
+
+	behavior atomic.Pointer[func(op string) Behavior] // fault hook; nil means none
 
 	mu      sync.Mutex // guards following
 	users   map[string]string
@@ -196,16 +216,63 @@ func NewFake(ln net.Listener) *Fake {
 	return f
 }
 
-// route is the single handler seam. It counts the request on receipt, asks the
-// op function for the protocol ops to send, and writes them. Op functions never
-// touch the response writer themselves, so fault behaviour (apply-then-drop,
-// delay, hang) can later be attached here in one place.
+// SetBehavior installs a fault hook. Every request asks h, once, for the
+// Behavior to apply to the operation of that name (an Op* constant); the hook
+// runs after the request has been counted and must not call back into the Fake.
+// A nil h clears the hook. It is safe for concurrent use.
+func (f *Fake) SetBehavior(h func(op string) Behavior) {
+	if h == nil {
+		f.behavior.Store(nil)
+		return
+	}
+	f.behavior.Store(&h)
+}
+
+// route is the single handler seam. Per request it counts on receipt, reads the
+// fault behaviour once, then closes, hangs or delays as asked, runs the op
+// function (which applies the operation and returns the protocol ops to send)
+// and finally writes the ops or, for CloseAfter, drops the connection instead.
+// Op functions never touch the response writer themselves. mu is never held
+// across a close, a wait or a write.
 func (f *Fake) route(name string, op func(*ldapserver.Message) []msg.ProtocolOp) ldapserver.HandlerFunc {
 	return func(w ldapserver.ResponseWriter, m *ldapserver.Message) {
 		f.mu.Lock()
 		f.counts[name]++
 		f.mu.Unlock()
-		for _, po := range op(m) {
+
+		var b Behavior
+		if h := f.behavior.Load(); h != nil {
+			b = (*h)(name)
+		}
+		if b.CloseBefore {
+			_ = m.Client.GetConn().Close()
+			return
+		}
+		if b.Hang {
+			select {
+			case <-m.Done:
+			case <-f.stop:
+			}
+			return
+		}
+		if b.Delay > 0 {
+			t := time.NewTimer(b.Delay)
+			select {
+			case <-t.C:
+			case <-m.Done:
+				t.Stop()
+				return
+			case <-f.stop:
+				t.Stop()
+				return
+			}
+		}
+		ops := op(m)
+		if b.CloseAfter {
+			_ = m.Client.GetConn().Close()
+			return
+		}
+		for _, po := range ops {
 			w.Write(po)
 		}
 	}
