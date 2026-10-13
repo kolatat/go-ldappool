@@ -35,11 +35,22 @@ const (
 	scopeSub  = 2
 )
 
-// entry is a stored directory entry.
+// entry is a stored directory entry. attrs is guarded by Fake.mu and must never
+// be shared outside the lock: hand out a cloneAttrs copy instead.
 type entry struct {
 	dn    string
 	key   string // normalised dn
 	attrs map[string][]string
+}
+
+// cloneAttrs returns a deep copy of attrs: a new map whose value slices are
+// copies too. Callers take it while holding Fake.mu.
+func cloneAttrs(attrs map[string][]string) map[string][]string {
+	cp := make(map[string][]string, len(attrs))
+	for k, v := range attrs {
+		cp[k] = append([]string(nil), v...)
+	}
+	return cp
 }
 
 // ModifyChange is one change of a modify request exactly as the server received
@@ -323,13 +334,9 @@ func (f *Fake) AddUser(dn, password string) {
 
 // AddEntry appends a directory entry that Search can return.
 func (f *Fake) AddEntry(dn string, attrs map[string][]string) {
-	cp := make(map[string][]string, len(attrs))
-	for k, v := range attrs {
-		cp[k] = append([]string(nil), v...)
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.entries = append(f.entries, entry{dn: dn, key: normDN(dn), attrs: cp})
+	f.entries = append(f.entries, entry{dn: dn, key: normDN(dn), attrs: cloneAttrs(attrs)})
 }
 
 // onConnect registers state for a newly accepted connection. It runs before
@@ -444,11 +451,7 @@ func (f *Fake) Entry(dn string) (map[string][]string, bool) {
 	if i < 0 {
 		return nil, false
 	}
-	cp := make(map[string][]string, len(f.entries[i].attrs))
-	for k, v := range f.entries[i].attrs {
-		cp[k] = append([]string(nil), v...)
-	}
-	return cp, true
+	return cloneAttrs(f.entries[i].attrs), true
 }
 
 // indexLocked returns the index of the entry with the normalised DN key, or -1.
@@ -610,7 +613,9 @@ func containsString(list []string, s string) bool {
 
 // doSearch returns every stored entry inside the request's base object and
 // scope, with all stored attributes, followed by a success done message. The
-// fake does not evaluate filters; it only counts the request.
+// response is built only from copies taken under the lock, because modify
+// writes the stored attribute maps concurrently. The fake does not evaluate
+// filters; it only counts the request.
 func (f *Fake) doSearch(m *ldapserver.Message) []msg.ProtocolOp {
 	r := m.GetSearchRequest()
 	base := normDN(string(r.BaseObject()))
@@ -620,7 +625,7 @@ func (f *Fake) doSearch(m *ldapserver.Message) []msg.ProtocolOp {
 	var hits []entry
 	for _, e := range f.entries {
 		if inScope(e.key, base, scope) {
-			hits = append(hits, e)
+			hits = append(hits, entry{dn: e.dn, key: e.key, attrs: cloneAttrs(e.attrs)})
 		}
 	}
 	f.mu.Unlock()

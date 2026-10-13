@@ -403,6 +403,103 @@ func TestFakeConcurrentSearch(t *testing.T) {
 	}
 }
 
+// TestFakeConcurrentSearchModify mixes searches and modifies on one client
+// connection. The server library handles every request of one client in its own
+// goroutine, so a search can run while a modify writes the stored attribute map;
+// a search that read that map outside the lock aborted the test binary with a
+// concurrent-map fatal error (CR-01).
+func TestFakeConcurrentSearchModify(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+	const stableDN = "cn=alice,dc=example,dc=com"
+	f.AddEntry(stableDN, map[string][]string{
+		"cn":   {"alice"},
+		"sn":   {"seed"},
+		"mail": {"alice@example.com", "a@example.com"},
+	})
+
+	c, err := f.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	c.SetTimeout(10 * time.Second)
+
+	const searchers, modifiers, iterations = 4, 4, 1000
+	var wg sync.WaitGroup
+	errs := make(chan error, searchers+modifiers)
+	for s := 0; s < searchers; s++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				sr, err := c.Search(ldap.NewSearchRequest(
+					"dc=example,dc=com", ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
+					0, 0, false, "(cn=alice)", nil, nil))
+				if err != nil {
+					errs <- fmt.Errorf("search %d: %w", i, err)
+					return
+				}
+				if len(sr.Entries) != 1 {
+					errs <- fmt.Errorf("search %d returned %d entries, want 1", i, len(sr.Entries))
+					return
+				}
+				if got := sr.Entries[0].GetAttributeValue("cn"); got != "alice" {
+					errs <- fmt.Errorf("search %d: cn = %q, want alice", i, got)
+					return
+				}
+			}
+		}()
+	}
+	for m := 0; m < modifiers; m++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tmp := fmt.Sprintf("tmp%d", m)
+			for i := 0; i < iterations; i++ {
+				req := ldap.NewModifyRequest(stableDN, nil)
+				req.Replace("sn", []string{fmt.Sprintf("sn-%d-%d", m, i)})
+				if i%2 == 0 {
+					req.Replace(tmp, []string{"v"})
+				} else {
+					req.Delete(tmp, nil)
+				}
+				if err := c.Modify(req); err != nil {
+					errs <- fmt.Errorf("modify %d/%d: %w", m, i, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	if got, want := f.Count(OpSearch), searchers*iterations; got != want {
+		t.Errorf("search count = %d, want %d", got, want)
+	}
+	if got, want := f.Count(OpModify), modifiers*iterations; got != want {
+		t.Errorf("modify count = %d, want %d", got, want)
+	}
+	attrs, ok := f.Entry(stableDN)
+	if !ok {
+		t.Fatalf("entry %s missing", stableDN)
+	}
+	if got := attrs["cn"]; len(got) != 1 || got[0] != "alice" {
+		t.Errorf("cn = %q, want [alice]", got)
+	}
+	if got := attrs["mail"]; len(got) != 2 {
+		t.Errorf("mail = %q, want two values", got)
+	}
+	for name := range attrs {
+		if strings.HasPrefix(name, "tmp") {
+			t.Errorf("attribute %q left behind", name)
+		}
+	}
+}
+
 // TestFixMessageID checks the wire repair of message IDs that the server
 // library's encoder gets wrong, across ID widths and length-field boundaries.
 func TestFixMessageID(t *testing.T) {
