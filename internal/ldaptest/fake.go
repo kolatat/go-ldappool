@@ -650,10 +650,83 @@ func (f *Fake) doSearch(m *ldapserver.Message) []msg.ProtocolOp {
 	return append(ops, ldapserver.NewSearchResultDoneResponse(ldapserver.LDAPResultSuccess))
 }
 
-// normDN compares DNs textually: spaces trimmed, lower-cased. It deliberately
-// does not use go-ldap's parser, so strict parsing cannot hide fake behaviour.
+// normDN returns a canonical comparison key for dn. It makes the forms that AD
+// treats as equal compare equal, and nothing more:
+//
+//   - case is folded;
+//   - unescaped spaces around ',', ';', '+' and '=' and at both ends are
+//     dropped, so "CN=a, OU=b" equals "cn=a,ou=b";
+//   - ';' is read as ',' (RFC 2253 allows both RDN separators);
+//   - "\XX" hex escapes are decoded, and a character that needs escaping in a
+//     value (one of , + " \ < > ;) is written back as a backslash plus that
+//     character, so "\2C" equals "\,". "\ " (escaped space) is a plain
+//     space, and any other backslash-escaped character loses the backslash.
+//
+// It deliberately does not use go-ldap's parser, so strict parsing cannot hide
+// fake behaviour. Not handled: quoted values ("..."), '#'-prefixed hex-string
+// values, multi-valued RDN reordering ("a=1+b=2" versus "b=2+a=1") and
+// attribute-type OIDs; such DNs only compare equal when they are textually
+// equal after the steps above.
 func normDN(dn string) string {
-	return strings.ToLower(strings.TrimSpace(dn))
+	out := make([]byte, 0, len(dn))
+	pending := 0 // unescaped spaces seen but not yet emitted
+	skipping := true
+	emit := func(b byte) {
+		for ; pending > 0; pending-- {
+			out = append(out, ' ')
+		}
+		out = append(out, b)
+		skipping = false
+	}
+	emitLiteral := func(b byte) { // a decoded or escaped character of a value
+		if strings.IndexByte(`,+"\<>;`, b) >= 0 {
+			emit('\\')
+		}
+		emit(b)
+	}
+	for i := 0; i < len(dn); i++ {
+		switch c := dn[i]; c {
+		case ' ':
+			if !skipping {
+				pending++
+			}
+		case ',', ';', '+', '=':
+			pending = 0
+			if c == ';' {
+				c = ','
+			}
+			out = append(out, c)
+			skipping = true
+		case '\\':
+			switch {
+			case i+2 < len(dn) && isHex(dn[i+1]) && isHex(dn[i+2]):
+				emitLiteral(unhex(dn[i+1])<<4 | unhex(dn[i+2]))
+				i += 2
+			case i+1 < len(dn):
+				i++
+				emitLiteral(dn[i])
+			default: // lone trailing backslash
+				emitLiteral('\\')
+			}
+		default:
+			emit(c)
+		}
+	}
+	return strings.ToLower(string(out))
+}
+
+func isHex(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
+}
+
+func unhex(b byte) byte {
+	switch {
+	case b >= 'a':
+		return b - 'a' + 10
+	case b >= 'A':
+		return b - 'A' + 10
+	}
+	return b - '0'
 }
 
 // inScope reports whether the normalised entry DN key is within base and scope.

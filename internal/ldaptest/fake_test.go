@@ -216,6 +216,99 @@ func TestFakeModifyDelete(t *testing.T) {
 	}
 }
 
+// TestNormDN pins which DN spellings the fake treats as the same DN, and which
+// it keeps apart.
+func TestNormDN(t *testing.T) {
+	same := [][]string{
+		{"CN=a, OU=b,DC=x", "cn=a,ou=b,dc=x", "cn = a , ou = b , dc = x", "  CN=a,OU=b,DC=x  ", "cn=a;ou=b;dc=x"},
+		{`CN=Doe\, John,OU=Users`, `CN=Doe\2C John,OU=Users`, `cn=doe\2c john, ou=users`},
+		{`cn=a b`, `cn=a\ b`, `cn=a\20b`},
+		{`cn=x\+y`, `cn=x\2By`, `cn=x\2by`},
+		{`cn=a\\b`, `cn=a\5Cb`},
+		{`cn=a\"b`, `cn=a\22b`},
+		{`cn=caf` + "é", `cn=caf\C3\A9`, `CN=CAF\c3\a9`},
+		{`cn=a`, `cn=\41`, `cn=\a`},
+		{"", "  "},
+	}
+	for _, group := range same {
+		want := normDN(group[0])
+		for _, dn := range group[1:] {
+			if got := normDN(dn); got != want {
+				t.Errorf("normDN(%q) = %q, want %q (same as %q)", dn, got, want, group[0])
+			}
+		}
+	}
+
+	differ := [][2]string{
+		{`cn=a\,b,dc=x`, `cn=a,b,dc=x`}, // an escaped comma is not a separator
+		{`cn=a b`, `cn=ab`},
+		{`cn=a,dc=x`, `cn=b,dc=x`},
+		{`cn=a,ou=b`, `cn=a`},
+		{`cn=a\ `, `cn=a`}, // an escaped trailing space is part of the value
+	}
+	for _, p := range differ {
+		if normDN(p[0]) == normDN(p[1]) {
+			t.Errorf("normDN(%q) == normDN(%q) = %q, want different", p[0], p[1], normDN(p[0]))
+		}
+	}
+}
+
+// TestFakeDNEquivalentForms drives bind, search, modify and delete with DNs
+// spelled differently from the registered one, the way a pool test or a service
+// might build them.
+func TestFakeDNEquivalentForms(t *testing.T) {
+	verifyNoLeaks(t)
+	f := NewTCP(t)
+	const registered = `CN=Doe\, John,OU=Users,DC=corp,DC=example,DC=com`
+	const spaced = `CN=Doe\, John, OU=Users, DC=corp, DC=example, DC=com`
+	const hexed = `cn=doe\2C john,ou=users,dc=corp,dc=example,dc=com`
+	f.AddUser(registered, "secret")
+	f.AddEntry(registered, map[string][]string{"cn": {"John"}, "sn": {"old"}})
+
+	c, err := f.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.Bind(hexed, "secret"); err != nil {
+		t.Fatalf("bind with hex-escaped DN: %v", err)
+	}
+
+	for _, scope := range []int{ldap.ScopeBaseObject, ldap.ScopeWholeSubtree} {
+		base := spaced
+		if scope == ldap.ScopeWholeSubtree {
+			base = "DC=corp, DC=example, DC=com"
+		}
+		sr, err := c.Search(ldap.NewSearchRequest(
+			base, scope, ldap.NeverDerefAliases,
+			0, 0, false, "(objectClass=*)", nil, nil))
+		if err != nil {
+			t.Fatalf("search scope %d base %q: %v", scope, base, err)
+		}
+		if len(sr.Entries) != 1 || sr.Entries[0].DN != registered {
+			t.Errorf("search scope %d base %q returned %d entries, want only %q", scope, base, len(sr.Entries), registered)
+		}
+	}
+
+	mr := ldap.NewModifyRequest(spaced, nil)
+	mr.Replace("sn", []string{"new"})
+	if err := c.Modify(mr); err != nil {
+		t.Fatalf("modify with spaced DN: %v", err)
+	}
+	attrs, ok := f.Entry(hexed)
+	if !ok || len(attrs["sn"]) != 1 || attrs["sn"][0] != "new" {
+		t.Errorf("after modify, Entry(hexed) = %v, %v; want sn=[new]", attrs, ok)
+	}
+
+	if err := c.Del(ldap.NewDelRequest(hexed, nil)); err != nil {
+		t.Fatalf("delete with hex-escaped DN: %v", err)
+	}
+	if _, ok := f.Entry(registered); ok {
+		t.Error("entry still present after delete")
+	}
+}
+
 const (
 	adminDN = "cn=admin,dc=example,dc=com"
 	bobDN   = "cn=bob,dc=example,dc=com"
