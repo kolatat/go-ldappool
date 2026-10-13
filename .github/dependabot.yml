@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keeps the commit-SHA pins in .github/workflows/ up to date. Dependabot reads
+  # the "# vX.Y.Z" comment after each SHA and rewrites both together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # One module at the repository root (the adhelper package is part of it).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
