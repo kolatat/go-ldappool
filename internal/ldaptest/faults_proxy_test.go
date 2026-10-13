@@ -1,6 +1,8 @@
 package ldaptest
 
 import (
+	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -178,5 +180,96 @@ func TestFaultCloseWhileHalfOpen(t *testing.T) {
 	err := waitErr(t, res, "blocked search after Close")
 	if !netOrPlain(err) {
 		t.Errorf("blocked search class = %v, want network or plain", Classify(err))
+	}
+}
+
+// gatedProxy starts a proxy whose upstream dial blocks until release is called.
+// entered receives one value for every dial that starts, so a test can wait until
+// the proxy has accepted a connection and is inside its upstream dial. Cleanups
+// run last in, first out: release is registered after Close, so it runs first and
+// Close never waits on a blocked dial.
+func gatedProxy(t *testing.T, f *Fake) (p *Proxy, entered <-chan struct{}, release func()) {
+	t.Helper()
+	in := make(chan struct{}, 16)
+	gate := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	hook := func(network, address string) (net.Conn, error) {
+		in <- struct{}{}
+		<-gate
+		return net.Dial(network, address)
+	}
+	p, err := newProxy(f.Addr(), hook)
+	if err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	t.Cleanup(p.Close)
+	t.Cleanup(release)
+	return p, in, release
+}
+
+// waitEntered waits up to 5 seconds for the proxy to enter its upstream dial.
+func waitEntered(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy did not start its upstream dial within 5s")
+	}
+}
+
+// TestProxyResetDuringUpstreamDial: a Reset issued while the proxy is still
+// dialing upstream reaches the connection (WR-01); the proxy then forgets the pair
+// and leaks nothing.
+func TestProxyResetDuringUpstreamDial(t *testing.T) {
+	verifyNoLeaks(t)
+	f := faultFake(t)
+	p, entered, release := gatedProxy(t, f)
+
+	c, err := ldap.DialURL("ldap://" + p.Addr())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	waitEntered(t, entered)
+
+	p.Reset()
+	eventually(t, 2*time.Second, c.IsClosing)
+	if err := faultSearch(c); !netOrPlain(err) {
+		t.Errorf("search after reset class = %v, want network or plain", Classify(err))
+	}
+
+	release()
+	eventually(t, 2*time.Second, func() bool { return len(p.snapshot()) == 0 })
+}
+
+// TestProxyPauseDuringUpstreamDial: a Pause issued while the proxy is still
+// dialing upstream holds the connection once the dial finishes (WR-01).
+func TestProxyPauseDuringUpstreamDial(t *testing.T) {
+	verifyNoLeaks(t)
+	f := faultFake(t)
+	p, entered, release := gatedProxy(t, f)
+
+	c, err := ldap.DialURL("ldap://" + p.Addr())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	waitEntered(t, entered)
+
+	p.Pause()
+	release()
+	eventually(t, 2*time.Second, func() bool { return f.NumConns() >= 1 })
+
+	c.SetTimeout(200 * time.Millisecond)
+	err = waitErr(t, searchAsync(c), "search on connection paused during dial")
+	if got := Classify(err); got != ClassNetwork {
+		t.Errorf("search classified %v, want %v", got, ClassNetwork)
+	}
+	if got := f.Count(OpSearch); got != 0 {
+		t.Errorf("fake received %d searches through a paused connection, want 0", got)
+	}
+	if c.IsClosing() {
+		t.Error("connection closing after a timeout; it should be left open")
 	}
 }
