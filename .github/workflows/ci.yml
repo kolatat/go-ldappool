@@ -1,0 +1,58 @@
+name: ci
+
+# Scheduled runs execute only on the default branch (main). Work currently
+# happens on a different branch, so the weekly run starts only after this file
+# reaches main. GitHub also disables scheduled workflows after 60 days without
+# repository activity; re-enable them from the Actions tab if that happens.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '23 5 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Linux only. go test -race does not build on the maintainer's Windows
+    # machine, so this job is the venue for race detection.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The go directive in go.mod is the floor, 1.26.0. The matrix names the
+        # latest 1.26 patch release and the latest stable release. The Go
+        # version is deliberately not derived from the go directive: that would
+        # install exactly go1.26.0, whose standard library has reachable
+        # advisories fixed in later patches, and govulncheck would then fail on
+        # a clean tree.
+        go: ['1.26.x', 'stable']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Vet
+        run: go vet ./...
+      - name: Test with the race detector
+        run: go test -race -count=1 ./...
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      # Default mode on purpose: the one module-level advisory for x/crypto's
+      # openpgp (not imported here, no fix exists) must not fail the job.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
